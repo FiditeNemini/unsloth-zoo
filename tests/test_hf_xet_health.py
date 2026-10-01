@@ -16,8 +16,8 @@
 
 """Tests for the per-machine Xet verdict.
 
-No test here touches the network: ``probe = False`` exercises the local decision path, and the one
-test that needs a probe result stubs ``_probe_cas_reachable``.
+No test here touches the network, and nothing in the module does: there is no probe, only the
+outcomes of real downloads.
 """
 
 from __future__ import annotations
@@ -34,7 +34,6 @@ from unsloth_zoo import hf_xet_tuning as tuning
 GB = 1_000_000_000
 
 # Grabbed at import, before the autouse fixture stubs it out.
-_UNSTUBBED_PROBE = health._probe_cas_reachable
 
 
 @pytest.fixture(autouse = True)
@@ -45,7 +44,6 @@ def _clean(monkeypatch, tmp_path):
                 "UNSLOTH_FORCE_XET", "HF_ENDPOINT"):
         monkeypatch.delenv(var, raising = False)
     monkeypatch.setattr(health, "_hf_xet_version", lambda: "9.9.9-test")
-    monkeypatch.setattr(health, "_probe_cas_reachable", lambda: (True, "probe ok"))
     health.clear_xet_health()
     yield
     health.clear_xet_health()
@@ -207,15 +205,6 @@ def test_failure_streak_resets_across_hf_xet_versions(monkeypatch):
     assert state["verdict"] == "xet"
 
 
-def test_probe_result_is_persisted(monkeypatch):
-    _big_machine(monkeypatch)
-    monkeypatch.setattr(health, "_probe_cas_reachable", lambda: (False, "Xet CAS unreachable"))
-    result = health.xet_health()
-    assert result.use_xet is False
-    assert result.source == "probe"
-    assert json.loads(health.health_state_path().read_text())["verdict"] == "http"
-
-
 def test_unwritable_state_dir_still_answers(monkeypatch):
     """A read-only HF_HOME must not stop downloads; it only costs the memory of the verdict."""
     _big_machine(monkeypatch)
@@ -238,145 +227,10 @@ def test_result_is_truthy_like_a_bool(monkeypatch):
     assert bool(health.XetHealth(False, "", "test")) is False
 
 
-def test_probe_404_is_inconclusive_not_a_demotion(monkeypatch):
-    """An HF_ENDPOINT mirror that does not host the probe repo answers 404, which proves the endpoint
-    is REACHABLE. Treating it as "Xet unreachable" pinned every mirror user to HTTP for 24h."""
-    import urllib.error
-    import urllib.request
-
-    _big_machine(monkeypatch)
-    monkeypatch.setattr(health, "_probe_cas_reachable", _UNSTUBBED_PROBE)
-
-    def _raise(*args, **kwargs):
-        raise urllib.error.HTTPError("http://mirror/x", 404, "Not Found", None, None)
-
-    monkeypatch.setattr(urllib.request, "urlopen", _raise)
-
-    ok, reason = health._probe_cas_reachable()
-    assert ok is None, reason
-
-    verdict = health.xet_health(force = True, probe = True)
-    assert verdict.use_xet is True
-    assert verdict.source == "default"
-    assert not health.health_state_path().exists(), "an inconclusive probe must persist nothing"
-
-
-def test_probe_401_is_inconclusive_not_a_demotion(monkeypatch):
-    """Nothing is sent, so a 401 only means auth was never attempted.
-
-    The 404 test cannot reach this arm: `or` short-circuits before the 401 half is evaluated.
-    `is None` below, not falsiness: the bug this guards returned False, which is falsy too.
-    """
-    import urllib.error
-    import urllib.request
-
-    _big_machine(monkeypatch)
-    monkeypatch.setattr(health, "_probe_cas_reachable", _UNSTUBBED_PROBE)
-    # Without a discoverable token this goes vacuous on any CI runner: the old code reached its
-    # inconclusive arm whenever no credential was found.
-    monkeypatch.setenv("HF_TOKEN", "hf_dummyTokenForTestsOnly000000000000")
-
-    def _raise(*args, **kwargs):
-        raise urllib.error.HTTPError("http://gated/x", 401, "Unauthorized", None, None)
-
-    monkeypatch.setattr(urllib.request, "urlopen", _raise)
-
-    ok, reason = health._probe_cas_reachable()
-    assert ok is None, reason
-
-    verdict = health.xet_health(force = True, probe = True)
-    assert verdict.use_xet is True
-    assert verdict.source == "default"
-    assert not health.health_state_path().exists(), "an inconclusive probe must persist nothing"
-
-
-def test_probe_429_is_inconclusive_not_a_demotion(monkeypatch):
-    """Throttling is not evidence that CAS is unreachable, and anonymity invites it: the /api/
-    quota is 500 per 5min shared PER IP against 1,000 per user (huggingface.co/docs/hub/rate-limits).
-    """
-    import urllib.error
-    import urllib.request
-
-    _big_machine(monkeypatch)
-    monkeypatch.setattr(health, "_probe_cas_reachable", _UNSTUBBED_PROBE)
-
-    def _raise(*args, **kwargs):
-        raise urllib.error.HTTPError("http://hf/x", 429, "Too Many Requests", None, None)
-
-    monkeypatch.setattr(urllib.request, "urlopen", _raise)
-
-    ok, reason = health._probe_cas_reachable()
-    assert ok is None, reason
-
-    verdict = health.xet_health(force = True, probe = True)
-    assert verdict.use_xet is True
-    assert verdict.source == "default"
-    assert not health.health_state_path().exists(), "a throttled probe must not persist a demotion"
-
-
-def test_probe_403_still_demotes(monkeypatch):
-    """A blocking corporate proxy legitimately answers 403, and that machine should use HTTP."""
-    import urllib.error
-    import urllib.request
-
-    _big_machine(monkeypatch)
-    monkeypatch.setattr(health, "_probe_cas_reachable", _UNSTUBBED_PROBE)
-
-    def _raise(*args, **kwargs):
-        raise urllib.error.HTTPError("http://hf/x", 403, "Forbidden", None, None)
-
-    monkeypatch.setattr(urllib.request, "urlopen", _raise)
-
-    ok, reason = health._probe_cas_reachable()
-    assert ok is False
-    assert "403" in reason
-
-
-def test_an_unprobed_memo_does_not_satisfy_an_explicit_probe(monkeypatch):
-    """The download path calls xet_health(probe=False) every time; memoizing that optimistic default
-    for all callers disarmed the explicit preflight for a minute, on exactly the CAS-blocked machine
-    the probe exists to catch."""
-    _big_machine(monkeypatch)
-    probes: list[bool] = []
-
-    def _blocked():
-        probes.append(True)
-        return (False, "CAS blocked by corporate proxy")
-
-    monkeypatch.setattr(health, "_probe_cas_reachable", _blocked)
-
-    cheap = health.xet_health(probe = False)
-    assert cheap.use_xet is True and cheap.source == "default"
-    assert probes == [], "the cheap path must not probe"
-
-    preflight = health.xet_health()          # probe defaults to True
-    assert probes == [True], "the explicit preflight was answered from an unprobed memo"
-    assert preflight.use_xet is False
-
-
-def test_a_real_verdict_still_short_circuits_every_caller(monkeypatch):
-    """The memo must keep working for real verdicts, or a snapshot pays a probe per file."""
-    _big_machine(monkeypatch)
-    probes: list[bool] = []
-
-    def _reachable():
-        probes.append(True)
-        return (True, "Xet CAS reachable")
-
-    monkeypatch.setattr(health, "_probe_cas_reachable", _reachable)
-
-    health.xet_health(force = True)
-    assert probes == [True]
-    for _ in range(5):
-        health.xet_health()
-    assert probes == [True], "a real verdict should not be re-probed within the memo window"
-
-
 def test_a_foreign_nodes_verdict_is_ignored(monkeypatch, tmp_path):
     """HF_HOME is routinely shared across a cluster: without machine scoping, one node with blocked
     CAS demotes every node for 24h, and no node then starts on Xet to record the clearing success."""
     _big_machine(monkeypatch)
-    monkeypatch.setattr(health, "_probe_cas_reachable", lambda: (True, "probe ok"))
 
     health.record_xet_outcome(False, "stall")
     health.record_xet_outcome(False, "stall")
@@ -390,29 +244,10 @@ def test_a_foreign_nodes_verdict_is_ignored(monkeypatch, tmp_path):
     )
 
 
-def test_the_probe_is_bounded_by_a_wall_clock(monkeypatch):
-    """urlopen's timeout is per operation and does not cover DNS, so the probe needs its own bound."""
-    import time as _time
-
-    monkeypatch.setattr(
-        health, "_probe_cas_reachable_inner", lambda: (_time.sleep(30), (True, "never"))[1]
-    )
-    monkeypatch.setattr(health, "PROBE_TIMEOUT_SECONDS", 0.2)
-
-    started = _time.monotonic()
-    ok, reason = _UNSTUBBED_PROBE()   # the autouse fixture stubs the module attribute
-    elapsed = _time.monotonic() - started
-
-    assert elapsed < 5.0, f"probe ran for {elapsed:.1f}s despite its budget"
-    assert ok is None, "an unbounded probe measured nothing, so it must not demote"
-    assert "budget" in reason
-
-
 def test_a_peer_nodes_failures_do_not_demote_this_one(monkeypatch, tmp_path):
     """Shared HF_HOME: scoping only the READ left writes merging streaks across nodes, so a peer's
     single failure demoted a healthy node on its own first failure."""
     _big_machine(monkeypatch)
-    monkeypatch.setattr(health, "_probe_cas_reachable", lambda: (True, "probe ok"))
 
     monkeypatch.setattr(health, "_machine_id", lambda: "node-a")
     health.record_xet_outcome(False, "stall on A")
@@ -428,7 +263,6 @@ def test_a_peer_nodes_failures_do_not_demote_this_one(monkeypatch, tmp_path):
 def test_a_peer_nodes_successes_do_not_rescue_a_broken_node(monkeypatch, tmp_path):
     """The mirror failure: a healthy peer's success kept zeroing a broken node's streak."""
     _big_machine(monkeypatch)
-    monkeypatch.setattr(health, "_probe_cas_reachable", lambda: (True, "probe ok"))
 
     for _ in range(2):
         monkeypatch.setattr(health, "_machine_id", lambda: "node-b")
@@ -443,3 +277,18 @@ def test_a_peer_nodes_successes_do_not_rescue_a_broken_node(monkeypatch, tmp_pat
     assert health.xet_health(probe = False).use_xet is False, (
         "a genuinely broken node never demoted because peers kept clearing its streak"
     )
+
+
+def test_asking_for_a_probe_never_reaches_the_network(monkeypatch):
+    """There is no reachability probe: probe = True answers from local state, like probe = False."""
+    import socket
+
+    def no_network(*_args, **_kwargs):
+        raise AssertionError("xet_health touched the network")
+
+    monkeypatch.setattr(socket, "getaddrinfo", no_network)
+    monkeypatch.setattr(socket.socket, "connect", no_network)
+    result = health.xet_health(force = True, probe = True)
+    assert result.use_xet is True
+    assert result.source == "default"
+    assert not health.health_state_path().exists()

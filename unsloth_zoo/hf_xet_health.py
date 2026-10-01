@@ -18,13 +18,13 @@
 
 ``hf_xet_fallback`` recovers from a bad Xet attempt, but recovery costs the whole stalled attempt
 EVERY time. Where Xet reliably fails (blocked CAS endpoint, a proxy that mangles range requests, too
-little RAM) that toll repeats forever, so this module remembers outcomes and re-probes later in case
-the cause was temporary.
+little RAM) that toll repeats forever, so this module remembers the outcomes of real downloads and
+forgets them after a while in case the cause was temporary. It never probes the network itself.
 
 Design rules:
-  * Never block a download: every probe is time-boxed and every failure path answers "use Xet", since
-    a wrong "healthy" costs one fallback while a wrong "unhealthy" downgrades a working machine.
-  * Cheapest checks first: override, hf_xet presence, RAM, remembered verdict, then the network.
+  * Never block a download: every failure path answers "use Xet", since a wrong "healthy" costs one
+    fallback while a wrong "unhealthy" downgrades a working machine.
+  * Cheapest checks first: override, hf_xet presence, RAM, then the remembered verdict.
   * A verdict is scoped to what could invalidate it (hf_xet version, endpoint), and expires.
 """
 
@@ -63,13 +63,9 @@ DEMOTED_TTL_SECONDS = 24 * 3600
 # One bad download is noise (a dropped wifi packet fails HTTP too); two in a row is a pattern.
 DEMOTION_THRESHOLD = 2
 
-# The probe runs on the request path, so it gets a strict budget.
-PROBE_TIMEOUT_SECONDS = 3.0
-_PROBE_REPO = "unsloth/Qwen3-30B-A3B-Instruct-2507"
 
 _TRUTHY = {"1", "true", "yes", "on"}
 _LOCK = threading.Lock()
-_PROBE_LOCK = threading.Lock()
 # Serialises the read-modify-write on the state FILE, which _LOCK (in-memory memo only) does not
 # cover. A success RESETS the streak while a failure INCREMENTS it, so interleaving the two records
 # two consecutive failures that never happened and demotes a healthy machine to HTTP for a day.
@@ -79,8 +75,6 @@ _STATE_MUTEX = threading.Lock()
 # How long a writer waits for a peer PROCESS before writing unserialised. The critical section is one
 # small read plus one os.replace, and degrading is safe: never blocking a download outranks the race.
 _STATE_LOCK_TIMEOUT = 5.0
-# (worker, result sink) for the at-most-one in-flight probe. Read and replaced only under _PROBE_LOCK.
-_PROBE_INFLIGHT: "Optional[tuple[threading.Thread, list]]" = None
 # (timestamp, verdict, was_probed). The probe flag is part of the key because the download path calls
 # with probe = False every time: without it that cheap lookup memoizes the optimistic "defaulting to
 # Xet" answer and disarms an explicit preflight for a minute, on exactly the CAS-blocked machine the
@@ -266,89 +260,6 @@ def _state_is_current(state: dict) -> bool:
         return False
 
 
-def _probe_cas_reachable() -> "tuple[Optional[bool], str]":
-    """Hard wall-clock bound around the probe.
-
-    urlopen's timeout is per blocking operation and does not cover getaddrinfo, so a stuck resolver or
-    a proxy trickling the response blows straight past PROBE_TIMEOUT_SECONDS.
-    """
-    global _PROBE_INFLIGHT
-
-    def _run(sink: list) -> None:
-        try:
-            sink.append(_probe_cas_reachable_inner())
-        except Exception as e:  # noqa: BLE001 - the probe must never raise into a download
-            sink.append((False, f"Xet CAS unreachable: {type(e).__name__}"))
-
-    # Single-flight: join(timeout) abandons the worker but cannot kill it, and a thread blocked in
-    # getaddrinfo is beyond in-process cancellation, so without this one blocked thread per preflight
-    # accumulates for the life of a server process. Only a LIVE worker is reused, so a
-    # finished-but-unread result can never be served stale.
-    with _PROBE_LOCK:
-        inflight = _PROBE_INFLIGHT
-        if inflight is None or not inflight[0].is_alive():
-            sink: list = []
-            worker = threading.Thread(
-                target = _run, args = (sink,), daemon = True, name = "unsloth-xet-probe",
-            )
-            inflight = _PROBE_INFLIGHT = (worker, sink)
-            worker.start()
-    worker, result = inflight
-    worker.join(PROBE_TIMEOUT_SECONDS + 0.5)
-    if not result:
-        # Inconclusive, not a demotion: nothing was measured, and a wrong "unhealthy" costs a
-        # working machine a day.
-        return (None, "Xet probe exceeded its time budget")
-    return result[0]
-
-
-def _probe_cas_reachable_inner() -> "tuple[Optional[bool], str]":
-    """Can we get a Xet read token and reach the CAS endpoint it names?
-
-    A token is NOT required: the endpoint answers anonymously, so this measures reachability
-    (proxy, firewalled CAS domain, offline), not authentication.
-    """
-    try:
-        import urllib.error
-        import urllib.request
-
-        url = f"{_endpoint()}/api/models/{_PROBE_REPO}/xet-read-token/main"
-        request = urllib.request.Request(url, headers = {"User-Agent": "unsloth-xet-probe"})
-        # No credential is attached: urllib ignores HF_HUB_DISABLE_IMPLICIT_TOKEN and keeps
-        # `Authorization` across a cross-host 3xx, which HF_ENDPOINT mirrors really do send.
-        deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
-        with urllib.request.urlopen(request, timeout = PROBE_TIMEOUT_SECONDS) as response:
-            if response.status != 200:
-                return (False, f"Xet token endpoint returned HTTP {response.status}")
-            payload = json.loads(response.read(64 * 1024).decode("utf-8", "replace"))
-
-        cas = payload.get("casUrl") or payload.get("cas_url")
-        if not cas:
-            return (True, "Xet token issued")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return (True, "Xet token issued (CAS check skipped, out of budget)")
-        # A HEAD to the CAS host root: any HTTP status counts as reachable, only a transport error
-        # means Xet cannot work here.
-        head = urllib.request.Request(cas, method = "HEAD", headers = {"User-Agent": "unsloth-xet-probe"})
-        try:
-            urllib.request.urlopen(head, timeout = remaining)
-        except urllib.error.HTTPError:
-            pass
-        return (True, "Xet CAS reachable")
-    except urllib.error.HTTPError as e:
-        # The endpoint ANSWERED, which is all this probe measures.
-        if e.code in (404, 401, 429):
-            # 404 mirror/on-prem, 401 auth never attempted, 429 throttling: none says anything
-            # about Xet, and the anonymous /api/ quota is 500 per 5min shared PER IP against
-            # 1,000 per user (huggingface.co/docs/hub/rate-limits), so one NAT exhausts it.
-            # 403/407 still demote -- that is how a blocking proxy answers.
-            return (None, "Xet probe inconclusive on this endpoint; assuming Xet")
-        return (False, f"Xet token endpoint returned HTTP {e.code}")
-    except Exception as e:
-        return (False, f"Xet CAS unreachable: {type(e).__name__}")
-
-
 def xet_health(*, force: bool = False, probe: bool = True) -> XetHealth:
     """Whether a download should START on Xet. Cheap and safe to call per download."""
     global _CACHED, _GENERATION
@@ -397,27 +308,9 @@ def _evaluate(*, force: bool, probe: bool) -> XetHealth:
         verdict = state.get("verdict") == "xet"
         return XetHealth(verdict, str(state.get("reason") or "remembered verdict"), "cached")
 
-    if not probe:
-        # No fresh verdict and no probing: Xet is the better default, the ladder covers a bad guess.
-        return XetHealth(True, "no cached verdict; defaulting to Xet", "default")
-
-    ok, reason = _probe_cas_reachable()
-    if ok is None:
-        # Persist nothing: a wrong "unhealthy" downgrades a working machine for a day, a wrong
-        # "healthy" costs one fallback.
-        return XetHealth(True, reason, "default")
-    with _STATE_MUTEX, _state_file_guard():
-        _write_state({
-            "verdict": "xet" if ok else "http",
-            "reason": reason,
-            "ts": time.time(),
-            "hf_xet_version": _hf_xet_version(),
-            "endpoint": _endpoint(),
-            "machine": _machine_id(),
-            # A fresh probe supersedes the old streak; failures are counted from here.
-            "consecutive_failures": 0,
-        })
-    return XetHealth(ok, reason, "probe")
+    # No fresh verdict: Xet is the better default, and the fallback ladder covers a bad guess.
+    # There is no network probe; verdicts come only from real downloads (record_xet_outcome).
+    return XetHealth(True, "no cached verdict; defaulting to Xet", "default")
 
 
 def record_xet_outcome(ok: bool, reason: str = "") -> None:

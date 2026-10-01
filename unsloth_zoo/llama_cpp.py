@@ -7539,16 +7539,16 @@ pass
 def _check_llama_cpp_appended_system_message():
     # See https://github.com/ggml-org/llama.cpp/issues/18323
     # See https://docs.unsloth.ai/basics/inference-and-deployment/llama-server-and-openai-endpoint#llama-server-quirks
-    llama_cpp_chat_file = "https://raw.githubusercontent.com/ggml-org/llama.cpp/refs/heads/master/common/chat.cpp"
+    # Read from the installed llama.cpp's own source tree, never fetched: it answers for the
+    # version that actually runs, offline. No source tree (a bare binary) means "no quirk".
     llama_cpp_appended = '''Respond in JSON format, either with `tool_call` (a request to call tools) or with `response` reply to the user's request'''
-    check = requests.get(llama_cpp_chat_file, timeout = 5)
+    chat_file = os.path.join(LLAMA_CPP_DEFAULT_DIR, "common", "chat.cpp")
     try:
-        check.raise_for_status()
-        check = check.content.decode("utf-8")
-        if llama_cpp_appended in check:
-            logger.info("llama.cpp appends an extra system message for tools. You should consider this.")
-            return llama_cpp_appended
-    except:
+        with open(chat_file, "r", encoding = "utf-8", errors = "replace") as handle:
+            if llama_cpp_appended in handle.read():
+                logger.info("llama.cpp appends an extra system message for tools. You should consider this.")
+                return llama_cpp_appended
+    except OSError:
         pass
     return ""
 

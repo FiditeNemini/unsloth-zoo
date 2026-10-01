@@ -37,7 +37,6 @@ import os
 import re
 import shutil
 import subprocess
-import urllib.request
 
 _IS_MLX = is_mlx_available()
 
@@ -69,49 +68,10 @@ def _extract_major_minor(version_text):
     return f"{match.group(1)}.{match.group(2)}"
 pass
 
-def _version_sort_key(version_text):
-    parts = [int(x) for x in re.findall(r"[0-9]+", str(version_text))]
-    if len(parts) < 2: parts = parts + [0]
-    return tuple(parts)
-pass
-
-@functools.cache
-def _pytorch_rocm_index_exists(rocm_index):
-    index_url = f"{_PYTORCH_WHL_BASE_URL}/{rocm_index}/"
-    # Some endpoints reject HEAD, so fallback to GET if needed.
-    methods = ("HEAD", "GET")
-    for method in methods:
-        try:
-            request = urllib.request.Request(
-                index_url,
-                headers = {"User-Agent" : "unsloth-zoo"},
-                method = method,
-            )
-            with urllib.request.urlopen(request, timeout = 2.5) as response:
-                if 200 <= getattr(response, "status", 200) < 400:
-                    return True
-        except Exception:
-            pass
-    return False
-pass
-
 @functools.cache
 def _available_pytorch_rocm_indices():
-    # Parse official wheel listing so we can suggest only valid ROCm endpoints.
-    known_defaults = ["rocm7.1", "rocm7.0", "rocm6.4", "rocm6.3", "rocm6.2", "rocm6.1"]
-    try:
-        request = urllib.request.Request(
-            f"{_PYTORCH_WHL_BASE_URL}/",
-            headers = {"User-Agent" : "unsloth-zoo"},
-        )
-        with urllib.request.urlopen(request, timeout = 2.5) as response:
-            html = response.read().decode("utf-8", errors = "ignore")
-        matches = set(re.findall(r"rocm[0-9]+\.[0-9]+(?:\.[0-9]+)?", html))
-        if matches:
-            return sorted(matches, key = _version_sort_key, reverse = True)
-    except Exception:
-        pass
-    return known_defaults
+    # A fixed list, never fetched: suggesting an index must not phone home.
+    return ["rocm7.1", "rocm7.0", "rocm6.4", "rocm6.3", "rocm6.2", "rocm6.1"]
 pass
 
 def _nearest_rocm_index(detected_major_minor, available_indices):
@@ -186,7 +146,6 @@ def _amd_installation_hint():
     if chosen_index is None:
         chosen_index = available_indices[0] if len(available_indices) else "rocm7.0"
     index_url = f"{_PYTORCH_WHL_BASE_URL}/{chosen_index}/"
-    index_is_valid = _pytorch_rocm_index_exists(chosen_index)
 
     lines = [
         "Unsloth detected signs of an AMD ROCm GPU, but your current PyTorch build has no usable HIP accelerator.",
@@ -200,12 +159,7 @@ def _amd_installation_hint():
     lines.append(
         f"uv pip install torch torchvision torchaudio --index-url {index_url} --upgrade --force-reinstall"
     )
-    if index_is_valid:
-        lines.append(f"Verified index URL is reachable: {index_url}")
-    else:
-        lines.append(
-            "Could not verify index URL reachability from this environment; if needed, choose a ROCm index from https://pytorch.org/get-started/locally/"
-        )
+    lines.append("If that index does not exist, choose a ROCm index from https://pytorch.org/get-started/locally/")
     return "\n".join(lines)
 pass
 
