@@ -29,6 +29,13 @@ import re
 if "TOKENIZERS_PARALLELISM" not in os.environ:
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# Network policy before anything else reads the environment: offline unless the user turned
+# access on (unsloth_network_policy). It sets the HF offline variables while Hub access is off,
+# which the block below then sees, and guards sockets for libraries that bypass those flags.
+import unsloth_network_policy as _network_policy
+_network_policy.activate()
+del _network_policy
+
 # Detect offline mode first. hf_transfer is a Rust downloader that bypasses
 # huggingface_hub's offline guard, so leaving it on defeats HF_HUB_OFFLINE
 # and TRANSFORMERS_OFFLINE entirely.

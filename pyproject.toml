@@ -104,6 +104,8 @@ version = {attr = "unsloth_zoo.__init__.__version__"}
 
 [tool.setuptools]
 include-package-data = false
+# Top-level so a process can import it without running unsloth_zoo/__init__.py.
+py-modules = ["unsloth_network_policy"]
 
 [tool.setuptools.package-data]
 unsloth_zoo = ["diffusion_studio/*.html"]
